@@ -48,6 +48,10 @@ const DEFAULT_SETTINGS = {
   proveItEnabled:true,       // ON: exit at scratch if entry shows no life by proveItSecs
   proveItSecs:75,            // seconds after entry the trade must have shown life by
   proveItMinMfePct:0.4,      // minimum MFE% required by then, else NO_LIFE exit
+  // === RESTING STOPS — real stop order resting on Alpaca's book (RTH only) ===
+  restingStopsEnabled:true,    // place a broker-side stop so fast collapses fill at exchange speed, not on the 15s scan
+  restingStopType:"stop",      // "stop" (market-on-trigger, can't be skipped) | "stop_limit" (won't fill at garbage, can gap through)
+  restingStopLimitBandPct:1.5, // stop_limit only: limit = stop × (1 − band%)
   // === GROK RUNNER (isolated, opt-in) — governs the final runner slice ONLY when enabled ===
   grokRunnerEnabled:false,           // master ON/OFF; OFF = existing runner exits unchanged
   runnerTrailType:"ATR_DYNAMIC",     // "PCT" | "ATR_DYNAMIC" | "EMA9_HYBRID"
@@ -1481,6 +1485,53 @@ async function sellAlpacaShares(ticker,qty,creds,curPrice){
   }catch(e){return false;}
 }
 
+// ── RESTING STOPS ───────────────────────────────────────────────────────────
+// Place a stop order that RESTS on Alpaca's order book and fills automatically at exchange
+// speed the instant price hits the trigger — no waiting for the 15s scan loop. This is the fix
+// for stop slippage (FRTT -12.8% on a -3% plan): a reactive stop fires AFTER the breach; a
+// resting stop fires AT it. RTH ONLY — Alpaca rejects stop/stop_limit outside regular hours,
+// so premarket/afterhours positions fall back to the reactive stop in the monitor loop.
+// "stop" = market-on-trigger (guaranteed exit, can't be skipped on a gap-through).
+// "stop_limit" = won't fill below the limit band (no garbage fills, but can be skipped if price
+// gaps clean through). Default "stop" because the whole point is to guarantee the exit.
+async function placeRestingStop(ticker,qty,stopPrice,creds,opts){
+  if(!qty||qty<1||!stopPrice||stopPrice<=0)return null;
+  if(inExtendedHours())return null;            // stops not accepted outside RTH
+  const sp=+stopPrice.toFixed(stopPrice<1?4:2);
+  let body;
+  if(opts&&opts.type==="stop_limit"){
+    const band=(opts.bandPct||1.5)/100;
+    const lim=+(stopPrice*(1-band)).toFixed(stopPrice<1?4:2);
+    body={symbol:ticker,qty:String(qty),side:"sell",type:"stop_limit",stop_price:String(sp),limit_price:String(lim),time_in_force:"day"};
+  } else {
+    body={symbol:ticker,qty:String(qty),side:"sell",type:"stop",stop_price:String(sp),time_in_force:"day"};
+  }
+  try{
+    const order=await aPost("/v2/orders",body,creds);
+    return order&&order.id?order.id:null;
+  }catch(e){return null;}
+}
+async function cancelRestingStop(orderId,creds){
+  if(!orderId)return;
+  try{await fetch(`${PROXY}/v2/orders/${orderId}`,{method:"DELETE",headers:aH(creds)});}catch(e){}
+}
+// Has the resting stop FILLED on Alpaca? Returns the confirmed fill price/qty so the bot can
+// reconcile its own state and surface the real exit price in the UI.
+async function checkOrderFilled(orderId,creds){
+  if(!orderId)return{filled:false};
+  try{
+    const r=await fetch(`${PROXY}/v2/orders/${orderId}`,{headers:aH(creds)});
+    if(!r.ok)return{filled:false};
+    const o=await r.json();
+    if(o.status==="filled"||o.status==="partially_filled"){
+      const price=parseFloat(o.filled_avg_price||"0"),fqty=parseInt(o.filled_qty||"0",10);
+      if(price>0&&fqty>0)return{filled:true,price,qty:fqty,status:o.status};
+    }
+    if(o.status==="canceled"||o.status==="rejected"||o.status==="expired")return{filled:false,dead:true,status:o.status};
+    return{filled:false,status:o.status};
+  }catch(e){return{filled:false};}
+}
+
 async function closeAlpacaPos(ticker,creds,curPrice){
   // STEP 1: cancel any pending orders on this symbol, then VERIFY they're gone. A leftover
   // unfilled premarket limit order causes Alpaca to reject the close with 422/403
@@ -1696,6 +1747,7 @@ function App(){
   const [radar,setRadar]=useState([]);
   const [circuitBreaker,setCircuitBreaker]=useState(false);
   const [regimeState,setRegimeState]=useState("UNKNOWN");
+  const [restingStops,setRestingStops]=useState({}); // {ticker: stopPrice} — reactive mirror for the OPEN POSITIONS badge
   const [creds,setCreds]=useState({keyId:"",secret:""});
   const [execMode,setExecMode]=useState("simulated");
   const [connStatus,setConnStatus]=useState({state:"disconnected",message:""});
@@ -1985,6 +2037,33 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
   // ============================================================
   // EXIT CHECKS — ADAPTIVE WITH PARTIAL PROFIT
   // ============================================================
+
+  // Cancel-and-replace the resting stop for a ticker at a new price/qty. Used on entry and after
+  // each stage moves the stop (Stage 1 → breakeven, Stage 2 → Stage-1 price). Keeps the broker-side
+  // stop in sync with the bot's intended stop. RTH only (placeRestingStop no-ops in extended hours).
+  const placeOrReplaceRestingStop=async(ticker,qty,stopPrice)=>{
+    const s=settingsRef.current;
+    if(!s.restingStopsEnabled||modeRef.current!=="alpaca"||connStatus.state!=="connected")return;
+    const old=getMkt(ticker).restingStopId;
+    if(old)await cancelRestingStop(old,credsRef.current);
+    const id=await placeRestingStop(ticker,qty,stopPrice,credsRef.current,{type:s.restingStopType,bandPct:s.restingStopLimitBandPct});
+    getMkt(ticker).restingStopId=id||null;
+    if(id){
+      setRestingStops(p=>({...p,[ticker]:stopPrice}));
+      setScanLog(p=>[{t:nowIso(),ticker,reason:`⛓ Resting ${s.restingStopType} @ $${fmt(stopPrice,4)} on Alpaca book`},...p.slice(0,49)]);
+    } else if(!inExtendedHours()){
+      setRestingStops(p=>{const n={...p};delete n[ticker];return n;});
+      setScanLog(p=>[{t:nowIso(),ticker,reason:`⚠ Resting stop not placed — reactive stop active`},...p.slice(0,49)]);
+    }
+  };
+  // Forget a ticker's resting stop locally (the broker-side order is already cancelled by
+  // closeAlpacaPos on any exit). Stops the reconciler polling a dead id and clears the badge.
+  const clearRestingStop=(ticker)=>{
+    getMkt(ticker).restingStopId=null;
+    getMkt(ticker).lastStopPoll=0;
+    setRestingStops(p=>{if(!(ticker in p))return p;const n={...p};delete n[ticker];return n;});
+  };
+
   useEffect(()=>{
     const open=tradesRef.current.openTrades;if(!open.length)return;
     const now=Date.now(),s=settingsRef.current;
@@ -1996,6 +2075,37 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
     for(const trade of open){
       const d=getMkt(trade.ticker);const px=priceRef.current[trade.ticker];if(!px)continue;
       const holdMs=now-new Date(trade.openedAt).getTime();
+      // ═══════════════════════════════════════════════════════════════════
+      // RESTING-STOP RECONCILER — if the broker-side stop FILLED on Alpaca, the position is
+      // already gone there. Update the app to match and book the trade at the CONFIRMED fill
+      // price. Runs before min-hold so a fast collapse that fills the resting stop in <60s is
+      // reflected immediately (this is the slippage case the resting stop exists to fix).
+      // Throttled to ~10s/ticker so it doesn't burn the API rate limit.
+      if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&getMkt(trade.ticker).restingStopId&&!getMkt(trade.ticker).pendingClose){
+        const lastPoll=getMkt(trade.ticker).lastStopPoll||0;
+        if(now-lastPoll>=10000){
+          getMkt(trade.ticker).lastStopPoll=now;
+          checkOrderFilled(getMkt(trade.ticker).restingStopId,credsRef.current).then(res=>{
+            if(res.filled){
+              const fillPx=res.price;
+              clearRestingStop(trade.ticker);
+              const isLoss=fillPx<trade.entry;
+              if(isLoss){
+                const loss=Math.abs((fillPx-trade.entry)/trade.entry*trade.size);
+                setDailyLoss(dl=>{const nl=dl+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
+                getMkt(trade.ticker).slHits=(getMkt(trade.ticker).slHits||0)+1;getMkt(trade.ticker).lastSlTime=Date.now();
+                updateRegime("LOSS");
+              } else { updateRegime("WIN"); }
+              setRegimeState(regime.current);
+              resetCounter(trade.ticker);
+              setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Resting stop FILLED @ $${fmt(fillPx,4)} — confirmed by Alpaca`},...p.slice(0,49)]);
+              dispatch({type:"CLOSE",tradeId:trade.id,closePrice:fillPx,reason:"SL",t:Date.now()});
+            } else if(res.dead){
+              clearRestingStop(trade.ticker); // order was cancelled/expired upstream — drop tracking, reactive stop covers
+            }
+          }).catch(()=>{});
+        }
+      }
       // EOD force-close — highest priority, overrides min-hold and everything else
       if(isEodWindow){
         const closePrice=px;
@@ -2008,7 +2118,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           } else {
             updateRegime("WIN");setRegimeState(regime.current);
           }
-          resetCounter(trade.ticker);
+          resetCounter(trade.ticker);clearRestingStop(trade.ticker);
           dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:"EOD_CLOSE",t:now});
         };
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
@@ -2051,9 +2161,17 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpPartialSize));
         // Send real SELL order to Alpaca (if in alpaca mode)
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(ok=>{
-            if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 1 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
-            else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 1 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(async ok=>{
+            if(!ok){setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 1 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);return;}
+            setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 1 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+            // Stage 1 cancelled the resting stop (cancel-before-sell). Re-place it at BREAKEVEN
+            // for whatever Alpaca actually still holds, so the runner is never left unprotected.
+            if(settingsRef.current.restingStopsEnabled){
+              await new Promise(r=>setTimeout(r,800));
+              const rem=await getAlpacaPositionQty(trade.ticker,credsRef.current);
+              if(rem>0)await placeOrReplaceRestingStop(trade.ticker,rem,trade.entry);
+              else clearRestingStop(trade.ticker);
+            }
           });
         }
         dispatch({type:"CLOSE_PARTIAL",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpPartialSize,sharesSold:sharesToSell});
@@ -2069,9 +2187,17 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         const originalShares=Math.floor((trade.originalSize||trade.size)/trade.entry);
         const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpStage2Size));
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(ok=>{
-            if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 2 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
-            else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 2 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(async ok=>{
+            if(!ok){setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 2 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);return;}
+            setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 2 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+            // Re-place the resting stop at the Stage-1 price (locks profit) for the runner slice.
+            if(settingsRef.current.restingStopsEnabled){
+              await new Promise(r=>setTimeout(r,800));
+              const rem=await getAlpacaPositionQty(trade.ticker,credsRef.current);
+              const newSl=trade.stage1Price||trade.entry;
+              if(rem>0)await placeOrReplaceRestingStop(trade.ticker,rem,newSl);
+              else clearRestingStop(trade.ticker);
+            }
           });
         }
         dispatch({type:"CLOSE_STAGE2",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpStage2Size,sharesSold:sharesToSell});
@@ -2224,7 +2350,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           } else {
             updateRegime("WIN");setRegimeState(regime.current);
           }
-          dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
+          clearRestingStop(trade.ticker);dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
         };
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
           // CRITICAL: do NOT mark the position closed until Alpaca CONFIRMS the close.
@@ -2562,6 +2688,11 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         },maxOpen:s.maxOpenTrades});
         open.add(ticker);
         getMkt(ticker).pendingEntry=false; // entry complete — clear in-flight guard
+        // Place the RESTING STOP on Alpaca's book for the full position at the structural SL.
+        // RTH only; premarket falls back to the reactive stop (logged by the helper).
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&s.restingStopsEnabled){
+          placeOrReplaceRestingStop(ticker,qty,sl).catch(()=>{});
+        }
         // Reset state machine
         getMkt(ticker).state="IDLE";
         break; // one trade per fire cycle
@@ -2578,7 +2709,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
     if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
       closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{
         if(ok){
-          dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
+          clearRestingStop(trade.ticker);dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
         } else {
           setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ MANUAL CLOSE FAILED ${trade.ticker} — still OPEN on Alpaca. Use Drift panel FORCE CLOSE.`},...p.slice(0,9)]);
         }
@@ -2640,6 +2771,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             regime.failureRate=0;
             regime.noTradeUntil=0;
             setRegimeState("UNKNOWN");
+            setRestingStops({}); // drop resting-stop badges; Alpaca day-orders expire at session end
           }} style={S.resetBtn}>RESET</button>
         </div>
       </header>
@@ -2871,7 +3003,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                   <td style={{...S.td,fontWeight:700,color:isFocused?"#FFB627":"#e8e8e8"}}>{o.ticker}{o.partialDone?" ½":""}</td>
                   <td style={{...S.tdR,color:o.score>=settings.minScore?"#7CFFB2":"#FFB627"}}>{o.score||"—"}</td>
                   <td style={S.tdR}>${fmt(o.entry,2)}</td><td style={S.tdR}>${fmt(px,2)}</td>
-                  <td style={{...S.tdR,color:"#FF7A7A"}}>${fmt(o.sl,2)}</td>
+                  <td style={{...S.tdR,color:"#FF7A7A"}}>${fmt(o.sl,2)}{restingStops[o.ticker]?<span title="Resting stop on Alpaca book" style={{color:"#7CFFB2",marginLeft:3}}>⛓</span>:null}</td>
                   <td style={{...S.tdR,color:"#7CFFB2"}}>${fmt(o.tp,2)}</td>
                   <td style={{...S.tdR,color:isLocked?"#FFB627":"#5a5a5a"}}>{isLocked?`🔒${holdSec}s`:`${holdSec}s`}</td>
                   <td style={{...S.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</td>
@@ -3203,6 +3335,19 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
             <span style={styles.fieldLabel}>SL COOLDOWN ENABLED</span>
           </label>
           <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,lineHeight:1.4}}>When ON: a ticker is blocked for 30min after hitting a stop-loss. When OFF: can re-enter immediately.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
+            <input type="checkbox" checked={!!settings.restingStopsEnabled} onChange={e=>set("restingStopsEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>RESTING STOPS (broker-side)</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>When ON: places a real stop on Alpaca's book that fills at exchange speed — protects against gap-through slippage. RTH only; premarket uses the reactive stop. ⛓ marks positions with a live resting stop.</div>
+          <label style={{display:"flex",flexDirection:"column",gap:2}}>
+            <span style={styles.fieldLabel}>RESTING STOP TYPE</span>
+            <select value={settings.restingStopType} onChange={e=>set("restingStopType",e.target.value)} style={{background:"#1a1a1a",color:"#e8e8e8",border:"1px solid #333",borderRadius:4,padding:"4px 6px",fontSize:11,cursor:"pointer"}}>
+              <option value="stop">stop (market-on-trigger — guaranteed exit)</option>
+              <option value="stop_limit">stop_limit (no garbage fills — can gap through)</option>
+            </select>
+          </label>
+          <NumField label="STOP-LIMIT BAND %" value={settings.restingStopLimitBandPct} min={0.2} max={5} step={0.1} onChange={v=>set("restingStopLimitBandPct",v)} help="stop_limit only: limit sits this % below the trigger. Default 1.5."/>
         </SettingGroup>
         <SettingGroup title="TIMING">
           <NumField label="SCAN INTERVAL MS" value={settings.scanIntervalMs} min={10000} max={300000} step={5000} onChange={v=>set("scanIntervalMs",v)}/>
