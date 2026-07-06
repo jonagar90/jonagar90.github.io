@@ -48,6 +48,15 @@ const DEFAULT_SETTINGS = {
   proveItEnabled:true,       // ON: exit at scratch if entry shows no life by proveItSecs
   proveItSecs:75,            // seconds after entry the trade must have shown life by
   proveItMinMfePct:0.4,      // minimum MFE% required by then, else NO_LIFE exit
+  // === REENTRY LANE — re-enter a just-exited ticker on a CONFIRMED continuation breakout ===
+  reentryEnabled:true,        // catch the real move after a scratch (the SURG case)
+  reentryWindowMins:90,       // re-entry allowed within N min of the exit
+  reentryMinSettleMins:3,     // but not sooner than this — no instant re-chase
+  reentryMaxPerTicker:1,      // max re-entries per ticker per day
+  reentryBreakoutPct:0.5,     // must break the prior-hour high by this % (real breakout, not drift)
+  reentryMinRvol:10,          // volume must still be exceptional
+  reentryMinScore:78,         // A-grade only
+  reentryMaxBelowExitLowPct:2,// base must have held — no undercut of the exit low beyond this %
   // === RESTING STOPS — real stop order resting on Alpaca's book (RTH only) ===
   restingStopsEnabled:true,    // place a broker-side stop so fast collapses fill at exchange speed, not on the 15s scan
   restingStopType:"stop",      // "stop" (market-on-trigger, can't be skipped) | "stop_limit" (won't fill at garbage, can gap through)
@@ -725,6 +734,42 @@ function checkEntry(ticker,s){
   // Price filter
   if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside $${s.priceMin}-$${s.priceMax}`};
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // REENTRY LANE — re-enter a ticker we recently exited, but ONLY on a confirmed
+  // continuation breakout of the prior high. This is the SURG fix: a legit breakout is
+  // often extended above VWAP, so this lane BYPASSES the extension cap — but only behind a
+  // strict stack (base held, prior-high break, expansion bar, rising, above VWAP, RVOL/score
+  // floors) so the bypass can't turn into a chase. Placed BEFORE the cooldown gates so it can
+  // override the post-exit cooldown when — and only when — it truly qualifies. Regime NO_TRADE
+  // still blocks the whole scan tick upstream, so this can't fire into a broken regime.
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(s.reentryEnabled){
+    const rexTime=d.reentryExitTime||0;
+    // daily reset of the per-ticker re-entry counter
+    const etDay=new Date(now).toLocaleDateString("en-US",{timeZone:"America/New_York"});
+    if(d.reentryDay!==etDay){d.reentryDay=etDay;d.reentryCount=0;}
+    const sinceExit=rexTime?now-rexTime:Infinity;
+    const inWindow=rexTime>0&&sinceExit>=(s.reentryMinSettleMins||3)*60000&&sinceExit<=(s.reentryWindowMins||90)*60000;
+    const underCap=(d.reentryCount||0)<(s.reentryMaxPerTicker||1);
+    if(inWindow&&underCap){
+      const rc=(d.candles1m||[]).slice(-60);
+      const priorHigh=rc.length>=15?Math.max(...rc.slice(0,-1).map(c=>c.high||0)):0;
+      const brokeHigh=priorHigh>0&&d.price>priorHigh*(1+(s.reentryBreakoutPct||0.5)/100);
+      // base held — the pullback didn't undercut the exit low beyond the tolerance
+      const exitLow=d.reentryExitLow||0;
+      const baseHeld=exitLow<=0||d.price>=exitLow*(1-(s.reentryMaxBelowExitLowPct||2)/100);
+      const exp=hasExpansionBar(d.candles1m,{rangeMult:s.expansionRangeMult}).ok;
+      const rise=isRising(d.price,d.candles1m,d.vwap,{maxBelowVwapPct:s.risingMaxBelowVwapPct}).rising;
+      const aboveVwap=d.vwap>0&&d.price>d.vwap;
+      const rvolOK=d.rvol>=(s.reentryMinRvol||10);
+      const reScore=scoreTickker(ticker,s);
+      const scoreOK=reScore>=(s.reentryMinScore||78);
+      if(brokeHigh&&baseHeld&&exp&&rise&&aboveVwap&&rvolOK&&scoreOK){
+        return{pass:true,rsi,rvol:d.rvol,gapPct:d.gapPct,strategy:"REENTRY",score:Math.max(reScore,s.reentryMinScore||78),vwap:d.vwap,ema9:d.ema9};
+      }
+    }
+  }
+
   // Cooldown / blacklist (skippable for testing via cooldownEnabled)
   if(s.cooldownEnabled&&now-d.lastSlTime<s.cooldownMs)return{pass:false,reason:`Cooldown — SL hit ${Math.round((now-d.lastSlTime)/60000)}m ago`};
   // Post-exit cooldown — prevents re-entry immediately after ANY exit on this ticker
@@ -1008,6 +1053,7 @@ function buildTradeReport(trade,tradeIndex){
   if(trade.reason==="RSI_EXIT")observations.push("✓ RSI overbought (≥82) — exited runner before reversal");
   if(trade.reason==="NO_PROGRESS")observations.push("△ Runner went flat 30+ min without new high — capital opportunity cost");
   if(trade.reason==="NO_LIFE")observations.push("✂ Prove-it scratch — entry showed no follow-through, cut before full SL");
+  if(trade.strategy==="REENTRY")observations.push("↻ Re-entry on confirmed continuation — took the breakout after an earlier exit");
   if(trade.reason==="GROK_TRAIL")observations.push("✓ Grok dynamic trail — runner ran, then exited as price fell off its peak");
   if(trade.reason==="GROK_RSI")observations.push("✓ Grok RSI exhaustion exit — momentum overheated on the runner");
   if(trade.reason==="GROK_VOL_FADE")observations.push("△ Grok volume-fade exit — RVOL collapsed on the runner");
@@ -2099,7 +2145,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
               setRegimeState(regime.current);
               resetCounter(trade.ticker);
               setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Resting stop FILLED @ $${fmt(fillPx,4)} — confirmed by Alpaca`},...p.slice(0,49)]);
-              dispatch({type:"CLOSE",tradeId:trade.id,closePrice:fillPx,reason:"SL",t:Date.now()});
+              getMkt(trade.ticker).reentryExitTime=Date.now();getMkt(trade.ticker).reentryExitLow=(trade.minPrice||trade.entry);dispatch({type:"CLOSE",tradeId:trade.id,closePrice:fillPx,reason:"SL",t:Date.now()});
             } else if(res.dead){
               clearRestingStop(trade.ticker); // order was cancelled/expired upstream — drop tracking, reactive stop covers
             }
@@ -2118,7 +2164,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           } else {
             updateRegime("WIN");setRegimeState(regime.current);
           }
-          resetCounter(trade.ticker);clearRestingStop(trade.ticker);
+          resetCounter(trade.ticker);clearRestingStop(trade.ticker);getMkt(trade.ticker).reentryExitTime=Date.now();getMkt(trade.ticker).reentryExitLow=(trade.minPrice||trade.entry);
           dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:"EOD_CLOSE",t:now});
         };
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
@@ -2350,7 +2396,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           } else {
             updateRegime("WIN");setRegimeState(regime.current);
           }
-          clearRestingStop(trade.ticker);dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
+          clearRestingStop(trade.ticker);getMkt(trade.ticker).reentryExitTime=Date.now();getMkt(trade.ticker).reentryExitLow=(trade.minPrice||trade.entry);dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
         };
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
           // CRITICAL: do NOT mark the position closed until Alpaca CONFIRMS the close.
@@ -2688,6 +2734,11 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         },maxOpen:s.maxOpenTrades});
         open.add(ticker);
         getMkt(ticker).pendingEntry=false; // entry complete — clear in-flight guard
+        if(check.strategy==="REENTRY"){
+          const rd=new Date().toLocaleDateString("en-US",{timeZone:"America/New_York"});
+          if(getMkt(ticker).reentryDay!==rd){getMkt(ticker).reentryDay=rd;getMkt(ticker).reentryCount=0;}
+          getMkt(ticker).reentryCount=(getMkt(ticker).reentryCount||0)+1;
+        }
         // Place the RESTING STOP on Alpaca's book for the full position at the structural SL.
         // RTH only; premarket falls back to the reactive stop (logged by the helper).
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&s.restingStopsEnabled){
@@ -2709,7 +2760,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
     if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
       closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{
         if(ok){
-          clearRestingStop(trade.ticker);dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
+          clearRestingStop(trade.ticker);getMkt(trade.ticker).reentryExitTime=Date.now();getMkt(trade.ticker).reentryExitLow=(trade.minPrice||trade.entry);dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
         } else {
           setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ MANUAL CLOSE FAILED ${trade.ticker} — still OPEN on Alpaca. Use Drift panel FORCE CLOSE.`},...p.slice(0,9)]);
         }
@@ -3277,6 +3328,16 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Scratch a pre-Stage-1 entry that hasn't ticked green by the window — kills dead-on-arrival entries before they ride the full SL.</div>
           <NumField label="PROVE-IT WINDOW (secs)" value={settings.proveItSecs} min={30} max={300} step={15} onChange={v=>set("proveItSecs",v)} help="entry must show life within N sec. Default 75. (60s min-hold applies first.)"/>
           <NumField label="PROVE-IT MIN MFE %" value={settings.proveItMinMfePct} min={0.1} max={3} step={0.1} onChange={v=>set("proveItMinMfePct",v)} help="min peak gain required by the window, else scratch. Default 0.4."/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
+            <input type="checkbox" checked={!!settings.reentryEnabled} onChange={e=>set("reentryEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>REENTRY LANE</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Re-enter a just-exited ticker on a confirmed breakout of its prior high (base held + expansion + above VWAP). Bypasses the VWAP-extension cap; max 1/ticker/day. The SURG fix.</div>
+          <NumField label="REENTRY WINDOW (mins)" value={settings.reentryWindowMins} min={10} max={240} step={10} onChange={v=>set("reentryWindowMins",v)} help="re-entry allowed within N min of the exit. Default 90."/>
+          <NumField label="REENTRY SETTLE (mins)" value={settings.reentryMinSettleMins} min={1} max={30} step={1} onChange={v=>set("reentryMinSettleMins",v)} help="but not sooner than this — no instant re-chase. Default 3."/>
+          <NumField label="REENTRY BREAKOUT %" value={settings.reentryBreakoutPct} min={0.1} max={3} step={0.1} onChange={v=>set("reentryBreakoutPct",v)} help="must break prior-hour high by this %. Default 0.5."/>
+          <NumField label="REENTRY MIN SCORE" value={settings.reentryMinScore} min={70} max={95} step={1} onChange={v=>set("reentryMinScore",v)} help="A-grade only. Default 78."/>
+          <NumField label="REENTRY MAX / TICKER" value={settings.reentryMaxPerTicker} min={1} max={3} step={1} onChange={v=>set("reentryMaxPerTicker",v)} help="max re-entries per ticker per day. Default 1."/>
           <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
             <input type="checkbox" checked={!!settings.structuralSlEnabled} onChange={e=>set("structuralSlEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
             <span style={styles.fieldLabel}>STRUCTURAL SL ENABLED</span>
